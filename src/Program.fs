@@ -7,6 +7,7 @@ type Arguments =
   | ConnectionString of string
   | Database of int
   | Output of string
+  | Parallelism of int
 
   interface IArgParserTemplate with
     member __.Usage =
@@ -14,17 +15,13 @@ type Arguments =
       | ConnectionString _ -> "connection string (defaults to localhost)"
       | Database _ -> "database number (defaults to 0)"
       | Output _ -> "output directory (defaults to currentDirectory/database)"
+      | Parallelism _ -> "number of parallel tasks (defaults to 1)"
 
-let stringGetAsync (database: IDatabase) (key: RedisKey) =
-  async {
-    let! redisValue = database.StringGetAsync key |> Async.AwaitTask
-    return string key, string redisValue
-  }
-
-let writeAllText (directory: DirectoryInfo) (name, text) =
-  async {
-    let path = Path.Combine(directory.FullName, name)
-    return! File.WriteAllTextAsync(path, text) |> Async.AwaitTask
+let worker (database: IDatabase) (directory: DirectoryInfo) (key: RedisKey) =
+  task {
+    let! redisValue = database.StringGetAsync key
+    let path = Path.Combine(directory.FullName, key)
+    do! File.WriteAllTextAsync(path, redisValue)
   }
 
 [<EntryPoint>]
@@ -36,6 +33,7 @@ let main argv =
     let connectionString = results.GetResult(<@ ConnectionString @>, "localhost")
     let database = results.GetResult(<@ Database @>, 0)
     let connectionMultiplexer = ConnectionMultiplexer.Connect connectionString
+    let parallelism = results.GetResult(<@ Parallelism @>, 1)
 
     let output =
       match results.TryGetResult(<@ Output @>) with
@@ -46,19 +44,17 @@ let main argv =
     let server =
       connectionMultiplexer.GetEndPoints().[0] |> connectionMultiplexer.GetServer
 
-    let keys = server.Keys database
     let redisDatabase = connectionMultiplexer.GetDatabase database
+    let worker = worker redisDatabase output
+    let consumer = Consumer.Consumer(parallelism, worker)
 
-    async {
-      do!
-        keys
-        |> AsyncSeq.ofSeq
-        |> AsyncSeq.mapAsyncParallel (stringGetAsync redisDatabase)
-        |> AsyncSeq.iterAsyncParallel (writeAllText output)
-    }
-    |> Async.RunSynchronously
+    for key in server.Keys database do
+      consumer.WriteAsync(key).AsTask().Wait()
+
+    consumer.Complete()
+    printf $"\rExported {consumer.ExecutionCount.Value} keys"
   with
-  | :? ArguParseException as ex -> printfn "%s" ex.Message
+  | :? ArguParseException as ex -> printfn $"{ex.Message}"
   | ex -> raise ex
 
   0
